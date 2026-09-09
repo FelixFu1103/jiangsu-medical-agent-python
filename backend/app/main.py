@@ -1,7 +1,9 @@
 from __future__ import annotations
 import asyncio
 import json
+import re
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
 import httpx
@@ -13,19 +15,45 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 from .agent import agent_graph
 from .config import get_settings
-from .db import close_pool, connection, open_pool
+from .db import chunks as chunk_store, close_db, documents as document_store, open_db
 from .ingestion import content_hash, extract_text, split_text
 from .rag import embed_documents
 
 
 SYSTEM_PROMPT = """你是江苏医保智能咨询Agent。只能依据提供的已发布资料回答，不得编造政策、材料、费用或时限。
-用简洁 Markdown 输出，“结论”“办理建议”“需要确认”各自单独换行，每段最多3点；不要输出大段连续文字。关键结论使用[资料1]标注依据。知识库没有答案时明确说明。
+严格使用“## 结论”“## 办理建议”“## 需要确认”三个Markdown标题，每段最多3点，不要输出其他标题或大段连续文字。关键结论使用[资料1]标注依据。知识库没有答案时明确说明。
 不得要求身份证号、银行卡号、密码或验证码，个案结果以当地医保部门答复为准。"""
 
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
     history: list[dict] = Field(default_factory=list)
+
+
+class MedicalAnswer(BaseModel):
+    conclusion: str
+    steps: list[str] = Field(default_factory=list)
+    confirmations: list[str] = Field(default_factory=list)
+
+
+def structured_answer(answer: str) -> dict:
+    clean = re.sub(r"\*\*(结论|办理建议|需要确认)\*\*", r"\1", answer)
+    parts = re.split(r"(?:^|\n)#{0,3}\s*(结论|办理建议|需要确认)[：:]?\s*", clean)
+    sections = {parts[index]: parts[index + 1].strip() for index in range(1, len(parts) - 1, 2)}
+
+    def items(name: str) -> list[str]:
+        return [re.sub(r"^[-*•\d.、\s]+", "", line).strip() for line in sections.get(name, "").splitlines() if line.strip()]
+
+    conclusion = " ".join(items("结论")) or answer.strip()
+    return MedicalAnswer(conclusion=conclusion, steps=items("办理建议"),
+                         confirmations=items("需要确认")).model_dump()
+
+
+def agent_metadata(state: dict) -> dict:
+    return {"responseType": state.get("response_type"), "missingSlots": state.get("missing_slots", []),
+            "evidenceReason": state.get("evidence_reason"), "retryCount": state.get("retry_count", 0),
+            "selectedTool": state.get("selected_tool"), "toolCalls": state.get("tool_calls", []),
+            "trace": state.get("trace", [])}
 
 
 def event(name: str, data: dict) -> str:
@@ -37,10 +65,8 @@ def immediate_stream(state: dict) -> StreamingResponse:
 
     async def stream():
         yield event("delta", {"text": message})
-        yield event("done", {"answer": message, "intent": state.get("intent"), "slots": state.get("slots", {}),
-                             "sources": [], "agent": {"responseType": state.get("response_type"),
-                             "missingSlots": state.get("missing_slots", []), "evidenceReason": state.get("evidence_reason"),
-                             "retryCount": state.get("retry_count", 0), "trace": state.get("trace", [])}})
+        yield event("done", {"answer": message, "structured": structured_answer(message), "intent": state.get("intent"),
+                             "slots": state.get("slots", {}), "sources": [], "agent": agent_metadata(state)})
 
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
 
@@ -51,28 +77,29 @@ def save_draft(title: str, department: str, source_url: str, text: str) -> dict:
     chunks = split_text(text)
     vectors = embed_documents([f"{title} {department} {part}" for part in chunks])
     digest = content_hash(text)
-    with connection() as conn:
-        with conn.transaction():
-            row = conn.execute("""INSERT INTO knowledge_documents
-              (content_hash,title,department,source_url,raw_content,status)
-              VALUES (%s,%s,%s,%s,%s,'draft')
-              ON CONFLICT(content_hash) DO UPDATE SET title=EXCLUDED.title, department=EXCLUDED.department,
-                source_url=EXCLUDED.source_url, raw_content=EXCLUDED.raw_content, updated_at=NOW()
-              RETURNING id,status""", (digest, title, department, source_url, text)).fetchone()
-            document_id, status = row
-            conn.execute("DELETE FROM knowledge_chunks WHERE document_id=%s", (document_id,))
-            with conn.cursor() as cursor:
-                cursor.executemany("""INSERT INTO knowledge_chunks
-                  (document_id,chunk_index,content,embedding) VALUES (%s,%s,%s,%s)""",
-                  [(document_id, index, chunk, vector) for index, (chunk, vector) in enumerate(zip(chunks, vectors))])
-    return {"id": str(document_id), "title": title, "status": status, "characters": len(text), "chunks": len(chunks)}
+    now = datetime.now(timezone.utc).isoformat()
+    existing = document_store().get(ids=[digest], include=["metadatas"])
+    created_at = existing["metadatas"][0].get("created_at", now) if existing["ids"] else now
+    metadata = {"content_hash": digest, "title": title, "department": department, "region": "江苏省",
+                "source_url": source_url, "status": "draft", "created_at": created_at, "updated_at": now}
+    document_store().upsert(ids=[digest], embeddings=[[0.0]], documents=[text], metadatas=[metadata])
+    store = chunk_store()
+    old = store.get(where={"document_id": digest})
+    if old["ids"]:
+        store.delete(ids=old["ids"])
+    chunk_metadata = [{"document_id": digest, "title": title, "department": department,
+                       "source_url": source_url, "status": "draft", "chunk_index": index}
+                      for index in range(len(chunks))]
+    store.upsert(ids=[f"{digest}:{index}" for index in range(len(chunks))], embeddings=vectors,
+                 documents=chunks, metadatas=chunk_metadata)
+    return {"id": digest, "title": title, "status": "draft", "characters": len(text), "chunks": len(chunks)}
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    open_pool()
+    open_db()
     yield
-    close_pool()
+    close_db()
 
 
 app = FastAPI(title="江苏医保 Agent API", lifespan=lifespan)
@@ -81,12 +108,10 @@ app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http
 
 @app.get("/api/health")
 def health():
-    with connection() as conn:
-        documents, chunks = conn.execute("""SELECT
-          (SELECT count(*) FROM knowledge_documents WHERE status='published'),
-          (SELECT count(*) FROM knowledge_chunks)""").fetchone()
-    return {"ok": True, "database": True, "publishedDocuments": documents, "chunks": chunks,
-            "embeddingModel": get_settings().embedding_model, "framework": "FastAPI + LangChain + LangGraph"}
+    published = document_store().get(where={"status": "published"})
+    return {"ok": True, "database": "ChromaDB", "publishedDocuments": len(published["ids"]),
+            "chunks": chunk_store().count(), "embeddingModel": get_settings().embedding_model,
+            "framework": "FastAPI + LangChain + LangGraph + ChromaDB"}
 
 
 @app.post("/api/chat")
@@ -114,10 +139,10 @@ async def chat(body: ChatRequest):
                 if text:
                     answer += text
                     yield event("delta", {"text": text})
-            yield event("done", {"answer": answer, "intent": state.get("intent"), "slots": state.get("slots"),
+            yield event("done", {"answer": answer, "structured": structured_answer(answer),
+                                  "intent": state.get("intent"), "slots": state.get("slots"),
                                   "sources": [{"title": d["title"], "url": d["source_url"], "chunkId": d["chunk_id"]} for d in documents],
-                                  "agent": {"responseType": "answer", "evidenceReason": state.get("evidence_reason"),
-                                  "retryCount": state.get("retry_count", 0), "trace": state.get("trace", [])}})
+                                  "agent": agent_metadata(state)})
         except Exception:
             yield event("error", {"error": "AI服务暂时不可用"})
 
@@ -152,29 +177,39 @@ async def upload_knowledge(title: str = Form(...), department: str = Form("江�
 
 @app.get("/api/knowledge")
 def list_knowledge():
-    with connection() as conn:
-        rows = conn.execute("""SELECT d.id,d.title,d.department,d.source_url,d.status,d.updated_at,count(c.id)
-          FROM knowledge_documents d LEFT JOIN knowledge_chunks c ON c.document_id=d.id
-          GROUP BY d.id ORDER BY CASE d.status WHEN 'draft' THEN 0 WHEN 'published' THEN 1 ELSE 2 END,d.updated_at DESC LIMIT 100""").fetchall()
-    return [{"id": str(r[0]), "title": r[1], "department": r[2], "source": r[3], "status": r[4], "updatedAt": r[5], "chunks": r[6]} for r in rows]
+    docs = document_store().get(include=["metadatas"])
+    stored_chunks = chunk_store().get(include=["metadatas"])
+    counts = {}
+    for metadata in stored_chunks["metadatas"]:
+        counts[metadata["document_id"]] = counts.get(metadata["document_id"], 0) + 1
+    rows = [{"id": doc_id, "title": meta["title"], "department": meta["department"],
+             "source": meta["source_url"], "status": meta["status"], "updatedAt": meta["updated_at"],
+             "chunks": counts.get(doc_id, 0)} for doc_id, meta in zip(docs["ids"], docs["metadatas"])]
+    return sorted(rows, key=lambda row: (row["status"] != "draft", row["updatedAt"]), reverse=False)[:100]
 
 
 @app.get("/api/knowledge/{document_id}")
-def get_knowledge(document_id: int):
-    with connection() as conn:
-        document = conn.execute("SELECT id,title,department,source_url,status,raw_content FROM knowledge_documents WHERE id=%s", (document_id,)).fetchone()
-        if not document:
-            raise HTTPException(404, "资料不存在")
-        chunks = conn.execute("SELECT id,chunk_index,content FROM knowledge_chunks WHERE document_id=%s ORDER BY chunk_index", (document_id,)).fetchall()
-    return {"id": str(document[0]), "title": document[1], "department": document[2], "source": document[3],
-            "status": document[4], "body": document[5], "chunks": [{"id": str(c[0]), "chunkIndex": c[1], "content": c[2], "vectorized": True} for c in chunks]}
+def get_knowledge(document_id: str):
+    document = document_store().get(ids=[document_id], include=["documents", "metadatas"])
+    if not document["ids"]:
+        raise HTTPException(404, "资料不存在")
+    meta = document["metadatas"][0]
+    stored = chunk_store().get(where={"document_id": document_id}, include=["documents", "metadatas"])
+    pieces = sorted(({"id": chunk_id, "chunkIndex": item["chunk_index"], "content": content, "vectorized": True}
+                     for chunk_id, content, item in zip(stored["ids"], stored["documents"], stored["metadatas"])),
+                    key=lambda item: item["chunkIndex"])
+    return {"id": document_id, "title": meta["title"], "department": meta["department"],
+            "source": meta["source_url"], "status": meta["status"], "body": document["documents"][0], "chunks": pieces}
 
 
 @app.post("/api/knowledge/{document_id}/publish")
-def publish_knowledge(document_id: int):
-    with connection() as conn:
-        row = conn.execute("UPDATE knowledge_documents SET status='published',updated_at=NOW() WHERE id=%s AND status='draft' RETURNING id,title,status", (document_id,)).fetchone()
-        conn.commit()
-    if not row:
+def publish_knowledge(document_id: str):
+    document = document_store().get(ids=[document_id], include=["documents", "metadatas"])
+    if not document["ids"] or document["metadatas"][0]["status"] != "draft":
         raise HTTPException(409, "资料不存在或不是草稿")
-    return {"id": str(row[0]), "title": row[1], "status": row[2]}
+    metadata = {**document["metadatas"][0], "status": "published", "updated_at": datetime.now(timezone.utc).isoformat()}
+    document_store().update(ids=[document_id], metadatas=[metadata])
+    stored = chunk_store().get(where={"document_id": document_id}, include=["metadatas"])
+    if stored["ids"]:
+        chunk_store().update(ids=stored["ids"], metadatas=[{**item, "status": "published"} for item in stored["metadatas"]])
+    return {"id": document_id, "title": metadata["title"], "status": "published"}

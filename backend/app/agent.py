@@ -1,7 +1,7 @@
 import re
 from typing import TypedDict
 from langgraph.graph import END, START, StateGraph
-from .rag import retrieve
+from .tools import run_tool
 
 INTENTS = {
     "cross_region": r"异地|跨省|备案|转诊", "family_mutual": r"家庭共济|共济|个人账户.*家人",
@@ -39,6 +39,8 @@ class AgentState(TypedDict, total=False):
     response_message: str
     retrieval_error: str
     trace: list[str]
+    selected_tool: str
+    tool_calls: list[dict]
 
 
 def traced(state: AgentState, node: str, **updates) -> dict:
@@ -99,11 +101,36 @@ def build_query(state: AgentState) -> dict:
     return traced(state, "build_query", query=f"{region_label} {history} {state['message']}".strip())
 
 
-def search_policy(state: AgentState) -> dict:
+def select_tool(state: AgentState) -> dict:
+    text = state["message"]
+    if re.search(r"报销比例|起付线|封顶线|试算", text):
+        tool = "calculate_reimbursement"
+    elif re.search(r"有效|失效|废止|现行", text):
+        tool = "verify_policy_status"
+    elif re.search(r"材料|清单", text):
+        tool = "generate_material_list"
+    elif re.search(r"药品|双通道|特药|目录", text):
+        tool = "query_drug_catalog"
+    elif re.search(r"医院|医疗机构", text):
+        tool = "query_hospital"
+    elif re.search(r"药店", text):
+        tool = "query_pharmacy"
+    elif state["intent"] in {"cross_region", "transfer", "enrollment", "chronic_disease"}:
+        tool = "get_service_guide"
+    else:
+        tool = "search_policy"
+    return traced(state, "select_tool", selected_tool=tool, tool_calls=[])
+
+
+def execute_tool(state: AgentState) -> dict:
+    name = state["selected_tool"]
     try:
-        return traced(state, "retrieve_policy", documents=retrieve(state["query"]), retrieval_error="")
+        documents = run_tool(name, state["query"])
+        call = {"name": name, "status": "success", "results": len(documents)}
+        return traced(state, "execute_tool", documents=documents, retrieval_error="", tool_calls=[*state.get("tool_calls", []), call])
     except Exception as error:
-        return traced(state, "retrieve_policy", documents=[], retrieval_error=type(error).__name__)
+        call = {"name": name, "status": "error", "results": 0}
+        return traced(state, "execute_tool", documents=[], retrieval_error=type(error).__name__, tool_calls=[*state.get("tool_calls", []), call])
 
 
 def assess_evidence(state: AgentState) -> dict:
@@ -152,7 +179,7 @@ graph = StateGraph(AgentState)
 for name, node in {
     "classify_intent": classify, "check_scope": check_scope, "reject_out_of_scope": reject_out_of_scope,
     "extract_slots": extract_slots, "check_slots": check_slots, "build_query": build_query,
-    "retrieve_policy": search_policy, "assess_evidence": assess_evidence, "rewrite_query": rewrite_query,
+    "select_tool": select_tool, "execute_tool": execute_tool, "assess_evidence": assess_evidence, "rewrite_query": rewrite_query,
     "fallback": fallback,
 }.items():
     graph.add_node(name, node)
@@ -162,9 +189,10 @@ graph.add_conditional_edges("check_scope", route_scope, {"continue": "extract_sl
 graph.add_edge("reject_out_of_scope", END)
 graph.add_edge("extract_slots", "check_slots")
 graph.add_conditional_edges("check_slots", route_slots, {"continue": "build_query", "stop": END})
-graph.add_edge("build_query", "retrieve_policy")
-graph.add_edge("retrieve_policy", "assess_evidence")
+graph.add_edge("build_query", "select_tool")
+graph.add_edge("select_tool", "execute_tool")
+graph.add_edge("execute_tool", "assess_evidence")
 graph.add_conditional_edges("assess_evidence", route_evidence, {"answer": END, "rewrite": "rewrite_query", "fallback": "fallback"})
-graph.add_edge("rewrite_query", "retrieve_policy")
+graph.add_edge("rewrite_query", "execute_tool")
 graph.add_edge("fallback", END)
 agent_graph = graph.compile()

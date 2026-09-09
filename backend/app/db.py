@@ -1,27 +1,26 @@
-from contextlib import contextmanager
-from psycopg_pool import ConnectionPool
-from pgvector.psycopg import register_vector
+from functools import lru_cache
+from pathlib import Path
+import chromadb
 from .config import get_settings
 
 
-def _url() -> str:
-    return get_settings().database_url.replace("postgresql+psycopg://", "postgresql://")
+@lru_cache
+def client():
+    return chromadb.PersistentClient(path=str(Path(get_settings().chroma_path).resolve()))
 
 
-pool = ConnectionPool(_url(), min_size=0, max_size=5, open=False, configure=register_vector)
+def documents():
+    return client().get_or_create_collection("knowledge_documents")
 
 
-def open_pool() -> None:
-    pool.open()
-    pool.wait()
+def chunks():
+    return client().get_or_create_collection("knowledge_chunks", metadata={"hnsw:space": "cosine"})
 
 
-def close_pool() -> None:
-    pool.close()
+def open_db() -> None:
+    documents()
+    chunks()
 
 
-@contextmanager
-def connection():
-    with pool.connection() as conn:
-        yield conn
-
+def close_db() -> None:
+    return None

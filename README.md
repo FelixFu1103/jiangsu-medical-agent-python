@@ -1,13 +1,16 @@
 # 江苏医保 Agent（Python版）
 
-这是与原Node.js项目并列的独立实现：Vue 3前端，FastAPI后端，LangGraph编排，LangChain连接DeepSeek与HuggingFace，PostgreSQL + pgvector负责文档状态和混合检索。没有使用ChromaDB。
+这是与原Node.js项目并列的独立实现：Vue 3前端，FastAPI后端，LangGraph编排，LangChain连接DeepSeek与HuggingFace，ChromaDB本地持久化文档、状态、片段和向量。
 
 ## 已实现
 
 - HuggingFace `BAAI/bge-m3` 本地1024维Embedding
-- pgvector HNSW向量检索 + `pg_trgm`关键词检索 + RRF融合
+- ChromaDB余弦向量检索 + 词面检索 + RRF融合
 - 可选 `BAAI/bge-reranker-v2-m3` Cross-Encoder精排
 - LangGraph条件工作流：范围判断、意图识别、槽位追问、政策检索、证据判断、一次Query改写重试与安全降级
+- 8个医保知识工具及LangGraph工具选择/执行节点
+- 结构化回答接口：结论、办理建议、需要确认
+- 前端Agent执行详情：工具、路径与证据判断
 - DeepSeek通过LangChain进行SSE流式回答
 - PDF、DOCX、TXT、Markdown、HTML和政府HTTPS网页导入
 - 上传为草稿、正文与片段预览、人工确认发布
@@ -15,7 +18,7 @@
 
 ## 启动
 
-要求Python 3.9+、Node.js 20+和Docker Desktop。
+要求Python 3.9+和Node.js 20+，不再需要Docker Desktop或PostgreSQL。
 
 ```bash
 cd /Users/macpor/Documents/Codex/2026-09-01/wo-2/outputs/jiangsu-medical-agent-python
@@ -26,12 +29,6 @@ cp .env.example .env
 
 ```env
 DEEPSEEK_API_KEY=你的key
-```
-
-启动数据库：
-
-```bash
-docker compose up -d postgres
 ```
 
 启动后端：
@@ -79,8 +76,7 @@ backend/app/main.py       FastAPI、SSE、知识库审核接口
 backend/app/agent.py      LangGraph工作流、意图与槽位
 backend/app/rag.py        bge-m3、混合检索、RRF与Reranker
 backend/app/ingestion.py  多格式解析与LangChain切分
-backend/app/db.py         PostgreSQL连接池
-backend/schema.sql        pgvector数据结构和索引
+backend/app/db.py         ChromaDB持久化客户端与集合
 frontend/src/App.vue      问答、上传、预览、发布页面
 ```
 

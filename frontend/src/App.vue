@@ -14,7 +14,7 @@ function formatAnswer(text = '') {
 async function send() {
   const value = question.value.trim(); if (!value || busy.value) return
   const history = messages.value.slice(-10); messages.value.push({ role: 'user', content: value }); question.value = ''; busy.value = true
-  messages.value.push({ role: 'assistant', content: '', sources: [] }); const answerIndex = messages.value.length - 1
+  messages.value.push({ role: 'assistant', content: '', sources: [], structured: null, agent: null }); const answerIndex = messages.value.length - 1
   try {
     const response = await fetch(`${api}/api/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: value, history }) })
     if (!response.ok) throw new Error((await response.json()).detail || '请求失败')
@@ -25,7 +25,7 @@ async function send() {
       for (const raw of events) {
         const name = raw.match(/^event: (.+)$/m)?.[1], data = JSON.parse(raw.match(/^data: (.+)$/m)?.[1] || '{}')
         if (name === 'delta') messages.value[answerIndex].content += data.text
-        if (name === 'done') messages.value[answerIndex].sources = data.sources
+        if (name === 'done') Object.assign(messages.value[answerIndex], { sources: data.sources, structured: data.structured, agent: data.agent })
         if (name === 'error') throw new Error(data.error)
       }
       if (done) break
@@ -51,10 +51,15 @@ onMounted(loadDocuments)
 
 <template>
   <div class="shell">
-    <header><div><b>江苏医保 Agent</b><small>Python · LangChain · LangGraph · pgvector</small></div><span>知识库 {{ documents.length }} 份</span></header>
+    <header><div><b>江苏医保 Agent</b><small>Python · LangChain · LangGraph · ChromaDB</small></div><span>知识库 {{ documents.length }} 份</span></header>
     <main>
       <section class="chat card">
-        <div class="messages"><article v-for="(m,i) in messages" :key="i" :class="m.role"><b>{{ m.role==='user'?'我':'医' }}</b><div><p v-if="m.content" v-html="formatAnswer(m.content)"></p><p v-else class="typing">正在生成…</p><footer v-if="m.sources?.length">官方依据：<a v-for="s in m.sources" :key="s.chunkId" :href="s.url" target="_blank">{{ s.title }}</a></footer></div></article></div>
+        <div class="messages"><article v-for="(m,i) in messages" :key="i" :class="m.role"><b>{{ m.role==='user'?'我':'医' }}</b><div>
+          <section v-if="m.structured" class="answer-grid"><h3>结论</h3><p>{{ m.structured.conclusion }}</p><template v-if="m.structured.steps.length"><h3>办理建议</h3><ol><li v-for="item in m.structured.steps" :key="item">{{ item }}</li></ol></template><template v-if="m.structured.confirmations.length"><h3>需要确认</h3><ul><li v-for="item in m.structured.confirmations" :key="item">{{ item }}</li></ul></template></section>
+          <p v-else-if="m.content" v-html="formatAnswer(m.content)"></p><p v-else class="typing">正在生成…</p>
+          <footer v-if="m.sources?.length">官方依据：<a v-for="s in m.sources" :key="s.chunkId" :href="s.url" target="_blank">{{ s.title }}</a></footer>
+          <details v-if="m.agent" class="trace"><summary>Agent 执行详情</summary><p>意图：{{ m.agent.responseType }} · 工具：{{ m.agent.selectedTool || '未调用' }}</p><p>路径：{{ m.agent.trace.join(' → ') }}</p><p v-if="m.agent.evidenceReason">证据：{{ m.agent.evidenceReason }}</p></details>
+        </div></article></div>
         <form class="composer" @submit.prevent="send"><textarea v-model="question" placeholder="请输入江苏医保问题"/><button :disabled="busy">发送</button></form>
       </section>
       <aside>
@@ -65,3 +70,7 @@ onMounted(loadDocuments)
     <div class="modal" v-if="preview" @click.self="preview=null"><section class="card preview"><button class="close" @click="preview=null">×</button><h2>{{ preview.title }}</h2><p>状态：{{ preview.status }} · {{ preview.chunks.length }}个向量片段</p><h3>提取正文</h3><pre>{{ preview.body }}</pre><h3>切分预览</h3><ol><li v-for="c in preview.chunks" :key="c.id">{{ c.content }}</li></ol><button v-if="preview.status==='draft'" @click="publish">确认发布</button></section></div>
   </div>
 </template>
+
+<style scoped>
+.answer-grid h3{margin:10px 0 4px;color:#123c70;font-size:15px}.answer-grid h3:first-child{margin-top:0}.answer-grid ol,.answer-grid ul{margin:4px 0;padding-left:22px}.answer-grid li{margin:5px 0;line-height:1.6}.trace{margin-top:10px;padding-top:8px;border-top:1px dashed #cad6e4;font-size:12px;color:#607086}.trace summary{cursor:pointer;color:#1761bd}.trace p{margin:5px 0;line-height:1.5}
+</style>

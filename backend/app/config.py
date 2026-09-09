@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     deepseek_api_key: str = ""
     deepseek_model: str = "deepseek-chat"
     deepseek_base_url: str = "https://api.deepseek.com"
-    database_url: str = "postgresql+psycopg://postgres:postgres@127.0.0.1:5433/jiangsu_medical_agent"
+    chroma_path: str = "../.chroma"
     embedding_model: str = "BAAI/bge-m3"
     embedding_device: str = "cpu"
     hf_cache_dir: str = "../.models"
